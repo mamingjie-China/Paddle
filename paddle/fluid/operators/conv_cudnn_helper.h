@@ -18,10 +18,10 @@ limitations under the License. */
 #include <array>
 #include <memory>
 #include <vector>
+#include "paddle/fluid/framework/conv_search_cache.h"
 #include "paddle/fluid/framework/operator_kernel_configs.h"
 #include "paddle/fluid/operators/conv_cudnn_op_cache.h"
 #include "paddle/fluid/platform/cudnn_desc.h"
-// #include "paddle/fluid/platform/device_context.h"
 namespace paddle {
 namespace operators {
 
@@ -90,43 +90,7 @@ std::ostream& operator<<(std::ostream& out, const std::vector<T>& v) {
   return out;
 }
 
-// ConvSearchCache using framework::AlgorithmsCache to search
-// cudnnConvolutionFwdAlgo_t, cudnnConvolutionBwdDataAlgo_t or
-// cudnnConvolutionBwdFilterAlgo_t
-class ConvSearchCache {
- public:
-  static ConvSearchCache& Instance() {
-    static ConvSearchCache instance;
-    return instance;
-  }
-
-  framework::AlgorithmsCache<cudnnConvolutionFwdAlgo_t>* GetForward() {
-    return &forward_cache_;
-  }
-  framework::AlgorithmsCache<cudnnConvolutionBwdDataAlgo_t>* GetBackwardData() {
-    return &backward_data_cache_;
-  }
-  framework::AlgorithmsCache<cudnnConvolutionBwdFilterAlgo_t>*
-  GetBackwardFilter() {
-    return &backward_filter_cache_;
-  }
-  framework::AlgorithmsCache<cudnnConvolutionFwdAlgo_t>* GetConvFusion() {
-    return &fusion_forward_cache_;
-  }
-
- private:
-  ConvSearchCache() {}
-  ~ConvSearchCache() {}
-  ConvSearchCache(const ConvSearchCache&) {}
-  ConvSearchCache& operator=(const ConvSearchCache&) {}
-
-  framework::AlgorithmsCache<cudnnConvolutionFwdAlgo_t> forward_cache_;
-  framework::AlgorithmsCache<cudnnConvolutionBwdDataAlgo_t>
-      backward_data_cache_;
-  framework::AlgorithmsCache<cudnnConvolutionBwdFilterAlgo_t>
-      backward_filter_cache_;
-  framework::AlgorithmsCache<cudnnConvolutionFwdAlgo_t> fusion_forward_cache_;
-};
+using framework::ConvSearchCache;
 
 struct ConvArgs {
   cudnnHandle_t handle;
@@ -184,7 +148,7 @@ struct SearchAlgorithm<cudnnConvolutionFwdAlgoPerf_t> {
     }
 #endif
 
-    if (!exhaustive) {
+    if (!exhaustive && !deterministic) {
 #if CUDNN_VERSION >= 7001
       int perf_count;
       int best_algo_idx = 0;
@@ -198,19 +162,7 @@ struct SearchAlgorithm<cudnnConvolutionFwdAlgoPerf_t> {
       workspace_size = GetWorkspaceSize(args, algo);
 
       if (workspace_size > workspace_size_limit) {
-        has_got_workspace_size = false;
-        VLOG(1) << "Fallback to non-v7 method to find conv algorithm becasue "
-                   "the workspace size request("
-                << workspace_size << ") exceeds the limit("
-                << workspace_size_limit << ")";
-      }
-      if (!has_got_workspace_size) {
-        PADDLE_ENFORCE_CUDA_SUCCESS(
-            platform::dynload::cudnnGetConvolutionForwardAlgorithm(
-                args.handle, args.idesc.desc(), args.wdesc.desc(),
-                args.cdesc.desc(), args.odesc.desc(),
-                CUDNN_CONVOLUTION_FWD_SPECIFY_WORKSPACE_LIMIT,
-                workspace_size_limit, &algo));
+        workspace_size_limit = workspace_size;
       }
 #else
       PADDLE_ENFORCE_CUDA_SUCCESS(
@@ -221,6 +173,8 @@ struct SearchAlgorithm<cudnnConvolutionFwdAlgoPerf_t> {
               workspace_size_limit, &algo));
 #endif
       VLOG(3) << "choose algo " << algo;
+    } else if (deterministic) {
+      algo = static_cast<cudnnConvolutionFwdAlgo_t>(1);
     } else {
       auto& dev_ctx =
           ctx.template device_context<platform::CUDADeviceContext>();
@@ -228,7 +182,7 @@ struct SearchAlgorithm<cudnnConvolutionFwdAlgoPerf_t> {
 
       auto& temp = ctx.cuda_device_context();
       AlgorithmsCache<algo_t>& algo_cache =
-          *(ConvSearchCache::Instance().GetForward());
+          *(framework::ConvSearchCache::Instance().GetForward());
 
       auto x_dims = framework::vectorize(args.x->dims());
       auto w_dims = framework::vectorize(args.w->dims());
@@ -337,19 +291,8 @@ struct SearchAlgorithm<cudnnConvolutionBwdDataAlgoPerf_t> {
 #endif
       workspace_size = GetWorkspaceSize(args, algo);
       if (workspace_size > workspace_size_limit) {
+        workspace_size_limit = workspace_size;
         has_got_workspace_size = false;
-        VLOG(1) << "Fallback to non-v7 method to find conv algorithm becasue "
-                   "the workspace size request("
-                << workspace_size << ") exceeds the limit("
-                << workspace_size_limit << ")";
-      }
-      if (!has_got_workspace_size) {
-        PADDLE_ENFORCE_CUDA_SUCCESS(
-            platform::dynload::cudnnGetConvolutionBackwardDataAlgorithm(
-                args.handle, args.wdesc.desc(), args.odesc.desc(),
-                args.cdesc.desc(), args.idesc.desc(),
-                CUDNN_CONVOLUTION_BWD_DATA_SPECIFY_WORKSPACE_LIMIT,
-                workspace_size_limit, &algo));
       }
 #else
       PADDLE_ENFORCE_CUDA_SUCCESS(
@@ -367,7 +310,7 @@ struct SearchAlgorithm<cudnnConvolutionBwdDataAlgoPerf_t> {
       auto workspace_handle = dev_ctx.cudnn_workspace_handle();
 
       AlgorithmsCache<algo_t>& algo_cache =
-          *(ConvSearchCache::Instance().GetBackwardData());
+          *(framework::ConvSearchCache::Instance().GetBackwardData());
 
       auto x_dims = framework::vectorize(args.x->dims());
       auto w_dims = framework::vectorize(args.w->dims());
@@ -466,19 +409,7 @@ struct SearchAlgorithm<cudnnConvolutionBwdFilterAlgoPerf_t> {
       algo = (perf_results.get())[best_algo_idx].algo;
       workspace_size = GetWorkspaceSize(args, algo);
       if (workspace_size > workspace_size_limit) {
-        has_got_workspace_size = false;
-        VLOG(1) << "Fallback to non-v7 method to find conv algorithm becasue "
-                   "the workspace size request("
-                << workspace_size << ") exceeds the limit("
-                << workspace_size_limit << ")";
-      }
-      if (!has_got_workspace_size) {
-        PADDLE_ENFORCE_CUDA_SUCCESS(
-            platform::dynload::cudnnGetConvolutionBackwardFilterAlgorithm(
-                args.handle, args.idesc.desc(), args.odesc.desc(),
-                args.cdesc.desc(), args.wdesc.desc(),
-                CUDNN_CONVOLUTION_BWD_FILTER_SPECIFY_WORKSPACE_LIMIT,
-                workspace_size_limit, &algo));
+        workspace_size = workspace_size_limit;
       }
 #else
       PADDLE_ENFORCE_CUDA_SUCCESS(
@@ -495,7 +426,7 @@ struct SearchAlgorithm<cudnnConvolutionBwdFilterAlgoPerf_t> {
           ctx.template device_context<platform::CUDADeviceContext>();
       auto workspace_handle = dev_ctx.cudnn_workspace_handle();
       AlgorithmsCache<algo_t>& algo_cache =
-          *(ConvSearchCache::Instance().GetBackwardFilter());
+          *(framework::ConvSearchCache::Instance().GetBackwardFilter());
 
       auto x_dims = framework::vectorize(args.x->dims());
       auto w_dims = framework::vectorize(args.w->dims());

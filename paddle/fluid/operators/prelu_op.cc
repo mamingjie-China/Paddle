@@ -10,6 +10,7 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/operators/prelu_op.h"
+
 #include <memory>
 #include <string>
 
@@ -31,10 +32,11 @@ class PReluOp : public framework::OperatorWithKernel {
     auto x_dim = ctx->GetInputDim("X");
     std::string mode = ctx->Attrs().Get<std::string>("mode");
     if (mode == "all") {
-      PADDLE_ENFORCE_EQ(
-          product(ctx->GetInputDim("Alpha")), 1,
-          platform::errors::InvalidArgument(
-              "For mode 'all', size of weight Alpha must be one."));
+      PADDLE_ENFORCE_EQ(product(ctx->GetInputDim("Alpha")), 1,
+                        platform::errors::InvalidArgument(
+                            "For mode 'all', size of weight Alpha must be one. "
+                            "But recevied alpha's size: %d.",
+                            product(ctx->GetInputDim("Alpha"))));
     } else if (mode == "channel") {
       PADDLE_ENFORCE_EQ(product(ctx->GetInputDim("Alpha")), x_dim[1],
                         platform::errors::InvalidArgument(
@@ -42,10 +44,23 @@ class PReluOp : public framework::OperatorWithKernel {
                             "equal to the number of channels of input(x). But "
                             "recevied alpha's size: %d, x_dim[1]: %d",
                             product(ctx->GetInputDim("Alpha")), x_dim[1]));
+      auto x_rank = x_dim.size();
+      PADDLE_ENFORCE_GE(x_rank, 2,
+                        platform::errors::InvalidArgument(
+                            "For mode 'channel', rank of input X must be "
+                            "equal or larger than 2. But recevied X's "
+                            "rank: %d",
+                            x_rank));
     } else if (mode == "element") {
       auto alpha_dim = ctx->GetInputDim("Alpha");
       auto alpha_rank = alpha_dim.size();
       auto x_rank = x_dim.size();
+      PADDLE_ENFORCE_GE(x_rank, 1,
+                        platform::errors::InvalidArgument(
+                            "For mode 'element', rank of input X must be "
+                            "equal or larger than 2. But recevied X's "
+                            "rank: %d",
+                            x_rank));
       PADDLE_ENFORCE_EQ(
           alpha_rank, x_rank,
           platform::errors::InvalidArgument(
@@ -67,7 +82,11 @@ class PReluOp : public framework::OperatorWithKernel {
               "x's size: %d.",
               alpha_product, x_product));
     } else {
-      PADDLE_THROW("Unkown mode %s", mode);
+      PADDLE_THROW(platform::errors::InvalidArgument(
+          "Attr(mode) of prelu must be one of 'all', 'channel', or 'element'. "
+          "But recevied "
+          "mode: '%s'.",
+          mode));
     }
     ctx->ShareDim("X", /*->*/ "Out");
     ctx->ShareLoD("X", /*->*/ "Out");

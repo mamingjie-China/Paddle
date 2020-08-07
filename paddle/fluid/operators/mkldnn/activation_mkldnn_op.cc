@@ -62,8 +62,9 @@ class MKLDNNActivationGradKernel
 template <typename T>
 void eltwise_forward(const framework::ExecutionContext &ctx,
                      mkldnn::algorithm algorithm) {
-  PADDLE_ENFORCE(paddle::platform::is_cpu_place(ctx.GetPlace()),
-                 "It must use CPUPlace.");
+  PADDLE_ENFORCE_EQ(platform::is_cpu_place(ctx.GetPlace()), true,
+                    paddle::platform::errors::PreconditionNotMet(
+                        "Operator DNNL eletwise_forward must use CPUPlace"));
   auto &dev_ctx = ctx.template device_context<MKLDNNDeviceContext>();
 
   const auto *x = ctx.Input<Tensor>("X");
@@ -90,7 +91,8 @@ void eltwise_forward(const framework::ExecutionContext &ctx,
       ctx.InputName("X"));
 
   auto src_memory_p = handler.AcquireSrcMemory(x);
-  auto dst_memory_p = handler.AcquireDstMemory(y);
+  auto dst_memory_p =
+      x->IsSharedBufferWith(*y) ? src_memory_p : handler.AcquireDstMemory(y);
   auto activation_p = handler.AcquireForwardPrimitive();
 
   mkldnn::stream astream(dev_ctx.GetEngine());
@@ -195,6 +197,10 @@ using SwishMKLDNNFunctor =
     MKLDNNActivationFunc<T, mkldnn::algorithm::eltwise_swish>;
 
 template <typename T>
+using SigmoidMKLDNNFunctor =
+    MKLDNNActivationFunc<T, mkldnn::algorithm::eltwise_logistic>;
+
+template <typename T>
 using TanhMKLDNNFunctor =
     MKLDNNActivationFunc<T, mkldnn::algorithm::eltwise_tanh>;
 
@@ -213,6 +219,10 @@ using ReluMKLDNNGradFunctor =
 template <typename T>
 using SwishMKLDNNGradFunctor =
     MKLDNNActivationGradFunc<T, mkldnn::algorithm::eltwise_swish>;
+
+template <typename T>
+using SigmoidMKLDNNGradFunctor =
+    MKLDNNActivationGradFunc<T, mkldnn::algorithm::eltwise_logistic>;
 
 template <typename T>
 using TanhMKLDNNGradFunctor =
@@ -237,13 +247,14 @@ namespace ops = paddle::operators;
       act_type##_grad, MKLDNN, ::paddle::platform::CPUPlace,               \
       ops::MKLDNNActivationGradKernel<ops::grad_functor<float>>);
 
-#define FOR_EACH_MKLDNN_KERNEL_FUNCTOR(__macro)                  \
-  __macro(relu, ReluMKLDNNFunctor, ReluMKLDNNGradFunctor);       \
-  __macro(leaky_relu, ReluMKLDNNFunctor, ReluMKLDNNGradFunctor); \
-  __macro(gelu, GeluMKLDNNFunctor, GeluMKLDNNGradFunctor);       \
-  __macro(swish, SwishMKLDNNFunctor, SwishMKLDNNGradFunctor);    \
-  __macro(tanh, TanhMKLDNNFunctor, TanhMKLDNNGradFunctor);       \
-  __macro(sqrt, SqrtMKLDNNFunctor, SqrtMKLDNNGradFunctor);       \
+#define FOR_EACH_MKLDNN_KERNEL_FUNCTOR(__macro)                     \
+  __macro(relu, ReluMKLDNNFunctor, ReluMKLDNNGradFunctor);          \
+  __macro(leaky_relu, ReluMKLDNNFunctor, ReluMKLDNNGradFunctor);    \
+  __macro(gelu, GeluMKLDNNFunctor, GeluMKLDNNGradFunctor);          \
+  __macro(swish, SwishMKLDNNFunctor, SwishMKLDNNGradFunctor);       \
+  __macro(sigmoid, SigmoidMKLDNNFunctor, SigmoidMKLDNNGradFunctor); \
+  __macro(tanh, TanhMKLDNNFunctor, TanhMKLDNNGradFunctor);          \
+  __macro(sqrt, SqrtMKLDNNFunctor, SqrtMKLDNNGradFunctor);          \
   __macro(abs, AbsMKLDNNFunctor, AbsMKLDNNGradFunctor);
 
 FOR_EACH_MKLDNN_KERNEL_FUNCTOR(REGISTER_ACTIVATION_MKLDNN_KERNEL);

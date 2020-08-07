@@ -1,11 +1,8 @@
 /* Copyright (c) 2018 PaddlePaddle Authors. All Rights Reserved.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
 http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -79,14 +76,14 @@ class EmbEltwiseLayerNormOpConverter : public OpConverter {
         get_persistable_data(op_desc.Input("Scale").front(), &scale_dims);
     int64_t bias_size = framework::product(bias_dims);
     int64_t scale_size = framework::product(scale_dims);
-    float eps = boost::get<float>(op_desc.GetAttr("epsilon"));
+    float eps = BOOST_GET_CONST(float, op_desc.GetAttr("epsilon"));
     nvinfer1::ILayer* layer = nullptr;
 
     if (engine_->with_dynamic_shape()) {
-      plugin::EmbEltwiseLayernormPluginDynamic* plugin =
-          new plugin::EmbEltwiseLayernormPluginDynamic(input_embs, bias, scale,
-                                                       emb_sizes, bias_size,
-                                                       scale_size, hidden, eps);
+      plugin::DynamicPluginTensorRT* plugin = nullptr;
+      plugin = new plugin::EmbEltwiseLayernormPluginDynamic<float>(
+          input_embs, bias, scale, emb_sizes, bias_size, scale_size, hidden,
+          eps);
       layer = engine_->AddPluginV2(input_ids.data(), input_num, plugin);
     } else {
       PADDLE_THROW(platform::errors::Fatal(

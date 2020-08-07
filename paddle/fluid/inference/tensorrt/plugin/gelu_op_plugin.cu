@@ -63,7 +63,7 @@ __global__ void gelu_kernel(const T a, int n, const T* input, T* output) {
   const int idx = blockIdx.x * TPB + threadIdx.x;
   if (idx < n) {
     const T in = input[idx];
-    const T cdf = 0.5 * (1.0 + erf(in * 0.5 * a));
+    const T cdf = 0.5f * (1.0f + erff(in * 0.5f * a));
     output[idx] = in * cdf;
   }
 }
@@ -132,9 +132,6 @@ int GeluPlugin::enqueue(int batch_size, const void* const* inputs,
 
 // Dynamic Plugin below.
 #if IS_TRT_VERSION_GE(6000)
-size_t GeluPluginDynamic::getSerializationSize() const { return 0; }
-
-void GeluPluginDynamic::serialize(void* buffer) const {}
 
 nvinfer1::DimsExprs GeluPluginDynamic::getOutputDimensions(
     int output_index, const nvinfer1::DimsExprs* inputs, int nb_inputs,
@@ -194,9 +191,8 @@ int GeluPluginDynamic::enqueue(const nvinfer1::PluginTensorDesc* input_desc,
   if (input_type == nvinfer1::DataType::kFLOAT) {
     const float* input = static_cast<const float*>(inputs[0]);
     float* output = static_cast<float*>(outputs[0]);
-    no_exact_gelu_kernel<float,
-                         block_size><<<grid_size, block_size, 0, stream>>>(
-        kAT, kBT, kCT, num, input, output);
+    gelu_kernel<float, block_size><<<grid_size, block_size, 0, stream>>>(
+        kA, num, input, output);
   } else if (input_type == nvinfer1::DataType::kHALF) {
 #ifdef SUPPORTS_CUDA_FP16
     const half* input = static_cast<const half*>(inputs[0]);

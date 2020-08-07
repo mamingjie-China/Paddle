@@ -31,10 +31,6 @@ static inline int NumBlocks(const int N) {
                   kNumMaxinumNumBlocks);
 }
 
-#define CUDA_1D_KERNEL_LOOP(i, n)                              \
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
-       i += blockDim.x * gridDim.x)
-
 template <class T>
 __device__ T BilinearInterpolate(const T* input_data, const int height,
                                  const int width, T y, T x) {
@@ -110,7 +106,7 @@ __global__ void GPUROIAlignForward(
     const float spatial_scale, const int channels, const int height,
     const int width, const int pooled_height, const int pooled_width,
     const int sampling_ratio, int* roi_batch_id_data, T* output_data) {
-  CUDA_1D_KERNEL_LOOP(i, nthreads) {
+  CUDA_KERNEL_LOOP(i, nthreads) {
     int pw = i % pooled_width;
     int ph = (i / pooled_width) % pooled_height;
     int c = (i / pooled_width / pooled_height) % channels;
@@ -165,7 +161,7 @@ __global__ void GPUROIAlignBackward(const int nthreads, const T* input_rois,
                                     const int pooled_width,
                                     const int sampling_ratio,
                                     int* roi_batch_id_data, T* input_grad) {
-  CUDA_1D_KERNEL_LOOP(i, nthreads) {
+  CUDA_KERNEL_LOOP(i, nthreads) {
     int pw = i % pooled_width;
     int ph = (i / pooled_width) % pooled_height;
     int c = (i / pooled_width / pooled_height) % channels;
@@ -260,7 +256,7 @@ class GPUROIAlignOpKernel : public framework::OpKernel<T> {
     auto cplace = platform::CPUPlace();
     int* roi_batch_id_data = roi_batch_id_list.mutable_data<int>(cplace);
     auto& dev_ctx = ctx.cuda_device_context();
-    auto gplace = boost::get<platform::CUDAPlace>(ctx.GetPlace());
+    auto gplace = BOOST_GET_CONST(platform::CUDAPlace, ctx.GetPlace());
     if (ctx.HasInput("RoisLod")) {
       auto* rois_lod = ctx.Input<Tensor>("RoisLod");
       int rois_batch_size = rois_lod->numel();
@@ -284,19 +280,26 @@ class GPUROIAlignOpKernel : public framework::OpKernel<T> {
       auto lod = rois->lod();
       PADDLE_ENFORCE_EQ(
           lod.empty(), false,
-          "Input(ROIs) Tensor of ROIAlignOp does not contain LoD information.");
+          platform::errors::InvalidArgument("Input(ROIs) in ROIAlignOp does "
+                                            "not contain LoD information."));
       auto rois_lod = lod.back();
       int rois_batch_size = rois_lod.size() - 1;
       PADDLE_ENFORCE_EQ(
           rois_batch_size, batch_size,
           platform::errors::InvalidArgument(
-              "The rois_batch_size and imgs "
-              "batch_size must be the same. But received rois_batch_size = %d, "
-              "batch_size = %d",
+              "The batch size of rois and batch size "
+              "of images must be the same. But received rois batch size = %d, "
+              "and images batch size = %d",
               rois_batch_size, batch_size));
       int rois_num_with_lod = rois_lod[rois_batch_size];
-      PADDLE_ENFORCE_EQ(rois_num, rois_num_with_lod,
-                        "The rois_num from input and lod must be the same.");
+      PADDLE_ENFORCE_EQ(
+          rois_num, rois_num_with_lod,
+          platform::errors::InvalidArgument(
+              "The actual number of rois and the number of rois "
+              "provided from Input(RoIsLoD) in RoIAlign must be the same."
+              " But received actual number of rois is %d, and the number "
+              "of rois from RoIsLoD is %d",
+              rois_num, rois_num_with_lod));
       for (int n = 0; n < rois_batch_size; ++n) {
         for (size_t i = rois_lod[n]; i < rois_lod[n + 1]; ++i) {
           roi_batch_id_data[i] = n;
@@ -344,7 +347,7 @@ class GPUROIAlignGradOpKernel : public framework::OpKernel<T> {
     int* roi_batch_id_data = roi_batch_id_list.mutable_data<int>(cplace);
 
     auto& dev_ctx = ctx.cuda_device_context();
-    auto gplace = boost::get<platform::CUDAPlace>(ctx.GetPlace());
+    auto gplace = BOOST_GET_CONST(platform::CUDAPlace, ctx.GetPlace());
     if (ctx.HasInput("RoisLod")) {
       auto* rois_lod = ctx.Input<Tensor>("RoisLod");
       int rois_batch_size = rois_lod->numel();

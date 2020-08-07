@@ -33,7 +33,9 @@ void BatchNormOp::InferShape(framework::InferShapeContext *ctx) const {
   OP_INOUT_CHECK(ctx->HasOutput("Y"), "Output", "Y", "BatchNorm");
 
   bool is_test = ctx->Attrs().Get<bool>("is_test");
-  if (!is_test) {
+  bool trainable_stats = ctx->Attrs().Get<bool>("trainable_statistics");
+  bool test_mode = is_test && (!trainable_stats);
+  if (!test_mode) {
     OP_INOUT_CHECK(ctx->HasOutput("MeanOut"), "Output", "MeanOut", "BatchNorm");
     OP_INOUT_CHECK(ctx->HasOutput("VarianceOut"), "Output", "VarianceOut",
                    "BatchNorm");
@@ -60,7 +62,9 @@ void BatchNormOp::InferShape(framework::InferShapeContext *ctx) const {
     auto mom = ctx->Inputs("MomentumTensor");
     PADDLE_ENFORCE_EQ(mom.size(), 1,
                       platform::errors::InvalidArgument(
-                          "Input(MomentumTensor) size must be 1"));
+                          "The input tensor MomentumTensor's size must be 1"
+                          "But received: MomentumTensor's size is [%d]",
+                          mom.size()));
   }
 
   PADDLE_ENFORCE_GE(
@@ -258,7 +262,11 @@ void BatchNormOpMaker::Make() {
                 "global mean and variance are also used during train time, "
                 "the BN acts as scaling and shiffting.")
       .SetDefault(false);
-
+  AddAttr<bool>("trainable_statistics",
+                "(bool, default false) Whether to calculate mean and variance "
+                "in test mode. If setting true in test mode, mean and variace "
+                "will be calculated by current batch statistics.")
+      .SetDefault(false);
   AddComment(R"DOC(
 Batch Normalization.
 
@@ -281,8 +289,10 @@ class BatchNormKernel<platform::CPUDeviceContext, T>
     float momentum = ctx.Attr<float>("momentum");
     const bool is_test = ctx.Attr<bool>("is_test");
     const bool use_global_stats = ctx.Attr<bool>("use_global_stats");
+    const bool trainable_stats = ctx.Attr<bool>("trainable_statistics");
+    bool test_mode = is_test && (!trainable_stats);
 
-    bool global_stats = is_test || use_global_stats;
+    bool global_stats = test_mode || use_global_stats;
 
     const std::string data_layout_str = ctx.Attr<std::string>("data_layout");
     const DataLayout data_layout =
@@ -290,12 +300,18 @@ class BatchNormKernel<platform::CPUDeviceContext, T>
 
     const auto *x = ctx.Input<Tensor>("X");
     const auto &x_dims = x->dims();
-    PADDLE_ENFORCE_GE(x_dims.size(), 2,
-                      platform::errors::InvalidArgument(
-                          "The Input X dim size should be larger than 1."));
-    PADDLE_ENFORCE_LE(x_dims.size(), 5,
-                      platform::errors::InvalidArgument(
-                          "The Input X dim size should be less than 6."));
+    PADDLE_ENFORCE_GE(
+        x_dims.size(), 2,
+        platform::errors::InvalidArgument(
+            "The size of input X's dimensions should be larger than 1."
+            "But received: the size of input X's dimensions is [%d]",
+            x_dims.size()));
+    PADDLE_ENFORCE_LE(
+        x_dims.size(), 5,
+        platform::errors::InvalidArgument(
+            "The size of input X's dimensions should be less than 6."
+            "But received: the size of input X's dimensionss is [%d]",
+            x_dims.size()));
     const int N = x_dims[0];
     const int C =
         (data_layout == DataLayout::kNCHW ? x_dims[1]
@@ -468,30 +484,21 @@ void BatchNormGradOp::InferShape(framework::InferShapeContext *ctx) const {
             "in gradient op kernel of batch_norm_mkldnn_op now."));
   }
 
-  // batch_norm_grad with inplace takes Y as input, without inplace
-  // takes X as input. HasInput will throw exception in compile time,
-  // so only infer shape in run time here.
-  if (ctx->IsRuntime()) {
-    PADDLE_ENFORCE_EQ(ctx->HasInput("X") || ctx->HasInput("Y"), true,
-                      platform::errors::NotFound(
-                          "Input(X) and Input(Y) should not be all null."));
-    auto input_name = "Y";
-    if (ctx->HasInput("X")) input_name = "X";
-    const auto x_dims = ctx->GetInputDim(input_name);
-    const DataLayout data_layout = framework::StringToDataLayout(
-        ctx->Attrs().Get<std::string>("data_layout"));
+  OP_INOUT_CHECK(ctx->HasInput("X"), "Input", "X", "BatchNormGrad");
+  const auto x_dims = ctx->GetInputDim("X");
+  const DataLayout data_layout = framework::StringToDataLayout(
+      ctx->Attrs().Get<std::string>("data_layout"));
 
-    const int C =
-        ((this->IsMKLDNNType() == true) || (data_layout == DataLayout::kNCHW)
-             ? x_dims[1]
-             : x_dims[x_dims.size() - 1]);
+  const int C =
+      ((this->IsMKLDNNType() == true) || (data_layout == DataLayout::kNCHW)
+           ? x_dims[1]
+           : x_dims[x_dims.size() - 1]);
 
-    ctx->SetOutputDim(framework::GradVarName("X"), x_dims);
-    // has_scale_grad == has_bias_grad, judge has_scale_grad is enough
-    if (has_scale_grad) {
-      ctx->SetOutputDim(framework::GradVarName("Scale"), {C});
-      ctx->SetOutputDim(framework::GradVarName("Bias"), {C});
-    }
+  ctx->SetOutputDim(framework::GradVarName("X"), x_dims);
+  // has_scale_grad == has_bias_grad, judge has_scale_grad is enough
+  if (has_scale_grad) {
+    ctx->SetOutputDim(framework::GradVarName("Scale"), {C});
+    ctx->SetOutputDim(framework::GradVarName("Bias"), {C});
   }
 }
 
@@ -607,12 +614,18 @@ class BatchNormGradKernel<platform::CPUDeviceContext, T>
     // Get the size for each dimension.
     // NCHW [batch_size, in_channels, in_height, in_width]
     const auto &x_dims = x->dims();
-    PADDLE_ENFORCE_GE(x_dims.size(), 2,
-                      platform::errors::InvalidArgument(
-                          "The Input X dim size should be larger than 1."));
-    PADDLE_ENFORCE_LE(x_dims.size(), 5,
-                      platform::errors::InvalidArgument(
-                          "The Input X dim size should be less than 6."));
+    PADDLE_ENFORCE_GE(
+        x_dims.size(), 2,
+        platform::errors::InvalidArgument(
+            "The size of input X's dimensions should be larger than 1."
+            "But received: the size of input X's dimensions is [%d]",
+            x_dims.size()));
+    PADDLE_ENFORCE_LE(
+        x_dims.size(), 5,
+        platform::errors::InvalidArgument(
+            "The size of input X's dimensions should be less than 6."
+            "But received: the size of input X's dimensions is [%d]",
+            x_dims.size()));
     const int N = x_dims[0];
     const int C =
         (data_layout == DataLayout::kNCHW ? x_dims[1]
@@ -806,7 +819,7 @@ void BatchNormGradMaker<T>::Apply(GradOpPtr<T> op) const {
   }
 
   // used when setting use_global_stats True during training
-  if (boost::get<bool>(this->GetAttr("use_global_stats"))) {
+  if (BOOST_GET_CONST(bool, this->GetAttr("use_global_stats"))) {
     op->SetInput("Mean", this->Output("MeanOut"));
     op->SetInput("Variance", this->Output("VarianceOut"));
   }

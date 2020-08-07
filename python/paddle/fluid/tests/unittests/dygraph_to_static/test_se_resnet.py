@@ -14,15 +14,17 @@
 
 import logging
 import math
-import numpy as np
 import time
 import unittest
+import numpy as np
 
 import paddle
 import paddle.fluid as fluid
-from paddle.fluid.dygraph.nn import Conv2D, Pool2D, BatchNorm, Linear
 from paddle.fluid.dygraph.base import to_variable
-from paddle.fluid.dygraph.jit import dygraph_to_static_func
+from paddle.fluid.dygraph.nn import BatchNorm, Conv2D, Linear, Pool2D
+from paddle.fluid.dygraph import declarative
+from paddle.fluid.dygraph import ProgramTranslator
+from paddle.fluid.dygraph.io import VARIABLE_FILENAME
 
 SEED = 2020
 np.random.seed(SEED)
@@ -31,10 +33,17 @@ BATCH_SIZE = 8
 EPOCH_NUM = 1
 PRINT_STEP = 2
 STEP_NUM = 10
+MODEL_SAVE_PATH = "./se_resnet.inference.model"
+DY_STATE_DICT_SAVE_PATH = "./se_resnet.dygraph"
 
-place = fluid.CPUPlace()
-# TODO(liym27): Diff exists between dygraph and static graph on CUDA place.
-# place = fluid.CUDAPlace(0) if fluid.is_compiled_with_cuda() else fluid.CPUPlace()
+place = fluid.CUDAPlace(0) if fluid.is_compiled_with_cuda() \
+    else fluid.CPUPlace()
+
+# Note: Set True to eliminate randomness.
+#     1. For one operation, cuDNN has several algorithms,
+#        some algorithm results are non-deterministic, like convolution algorithms.
+if fluid.is_compiled_with_cuda():
+    fluid.set_flags({'FLAGS_cudnn_deterministic': True})
 
 train_parameters = {
     "learning_strategy": {
@@ -98,7 +107,6 @@ class ConvBNLayer(fluid.dygraph.Layer):
 
         self._batch_norm = BatchNorm(num_filters, act=act)
 
-    @dygraph_to_static_func
     def forward(self, inputs):
         y = self._conv(inputs)
         y = self._batch_norm(y)
@@ -127,7 +135,6 @@ class SqueezeExcitation(fluid.dygraph.Layer):
                 initializer=fluid.initializer.Uniform(-stdv, stdv)),
             act='sigmoid')
 
-    @dygraph_to_static_func
     def forward(self, input):
         y = self._pool(input)
         y = fluid.layers.reshape(y, shape=[-1, self._num_channels])
@@ -179,7 +186,6 @@ class BottleneckBlock(fluid.dygraph.Layer):
 
         self._num_channels_out = num_filters * 2
 
-    @dygraph_to_static_func
     def forward(self, inputs):
         y = self.conv0(inputs)
         conv1 = self.conv1(y)
@@ -288,7 +294,7 @@ class SeResNeXt(fluid.dygraph.Layer):
             param_attr=fluid.param_attr.ParamAttr(
                 initializer=fluid.initializer.Uniform(-stdv, stdv)))
 
-    @dygraph_to_static_func
+    @declarative
     def forward(self, inputs, label):
         if self.layers == 50 or self.layers == 101:
             y = self.conv0(inputs)
@@ -301,6 +307,7 @@ class SeResNeXt(fluid.dygraph.Layer):
 
         for bottleneck_block in self.bottleneck_block_list:
             y = bottleneck_block(y)
+
         y = self.pool2d_avg(y)
         y = fluid.layers.dropout(y, dropout_prob=0.5, seed=100)
         y = fluid.layers.reshape(y, shape=[-1, self.pool2d_avg_output])
@@ -315,7 +322,10 @@ class SeResNeXt(fluid.dygraph.Layer):
         return out, avg_loss, acc_top1, acc_top5
 
 
-def train_dygraph(train_reader):
+def train(train_reader, to_static):
+    program_translator = ProgramTranslator()
+    program_translator.enable(to_static)
+
     np.random.seed(SEED)
 
     with fluid.dygraph.guard(place):
@@ -370,78 +380,58 @@ def train_dygraph(train_reader):
 
                 step_idx += 1
                 if step_idx == STEP_NUM:
+                    if to_static:
+                        configs = fluid.dygraph.jit.SaveLoadConfig()
+                        configs.output_spec = [pred]
+                        fluid.dygraph.jit.save(se_resnext, MODEL_SAVE_PATH,
+                                               [img], configs)
+                    else:
+                        fluid.dygraph.save_dygraph(se_resnext.state_dict(),
+                                                   DY_STATE_DICT_SAVE_PATH)
                     break
         return pred.numpy(), avg_loss.numpy(), acc_top1.numpy(), acc_top5.numpy(
         )
 
 
-def train_static(train_reader):
-    np.random.seed(SEED)
+def predict_dygraph(data):
+    program_translator = ProgramTranslator()
+    program_translator.enable(False)
+    with fluid.dygraph.guard(place):
+        se_resnext = SeResNeXt()
+
+        model_dict, _ = fluid.dygraph.load_dygraph(DY_STATE_DICT_SAVE_PATH)
+        se_resnext.set_dict(model_dict)
+        se_resnext.eval()
+
+        label = np.random.random([1, 1]).astype("int64")
+        img = fluid.dygraph.to_variable(data)
+        label = fluid.dygraph.to_variable(label)
+        pred_res, _, _, _ = se_resnext(img, label)
+
+        return pred_res.numpy()
+
+
+def predict_static(data):
     exe = fluid.Executor(place)
+    [inference_program, feed_target_names,
+     fetch_targets] = fluid.io.load_inference_model(
+         MODEL_SAVE_PATH, executor=exe, params_filename=VARIABLE_FILENAME)
 
-    main_prog = fluid.Program()
-    startup_prog = fluid.Program()
-    with fluid.program_guard(main_prog, startup_prog):
-        with fluid.unique_name.guard():
-            main_prog.random_seed = SEED
-            startup_prog.random_seed = SEED
-            img = fluid.data(
-                name="img", shape=[None, 3, 224, 224], dtype="float32")
-            label = fluid.data(name="label", shape=[None, 1], dtype="int64")
-            label.stop_gradient = True
+    pred_res = exe.run(inference_program,
+                       feed={feed_target_names[0]: data},
+                       fetch_list=fetch_targets)
 
-            se_resnext = SeResNeXt()
-            pred, avg_loss_, acc_top1_, acc_top5_ = se_resnext(img, label)
+    return pred_res[0]
 
-            optimizer = optimizer_setting(train_parameters,
-                                          se_resnext.parameters())
-            optimizer.minimize(avg_loss_)
 
-    exe.run(startup_prog)
+def predict_dygraph_jit(data):
+    with fluid.dygraph.guard(place):
+        se_resnext = fluid.dygraph.jit.load(MODEL_SAVE_PATH)
+        se_resnext.eval()
 
-    for epoch_id in range(EPOCH_NUM):
-        total_loss = 0.0
-        total_acc1 = 0.0
-        total_acc5 = 0.0
-        total_sample = 0
-        step_idx = 0
-        speed_list = []
-        for step_id, data in enumerate(train_reader()):
-            dy_x_data = np.array([x[0].reshape(3, 224, 224)
-                                  for x in data]).astype('float32')
-            y_data = np.array([x[1] for x in data]).astype('int64').reshape(
-                BATCH_SIZE, 1)
+        pred_res = se_resnext(data)
 
-            pred_, avg_loss, acc_top1, acc_top5 = exe.run(
-                main_prog,
-                feed={"img": dy_x_data,
-                      "label": y_data},
-                fetch_list=[pred, avg_loss_, acc_top1_, acc_top5_])
-
-            total_loss += avg_loss
-            total_acc1 += acc_top1
-            total_acc5 += acc_top5
-            total_sample += 1
-
-            if step_id % PRINT_STEP == 0:
-                if step_id == 0:
-                    logging.info( "epoch %d | step %d, loss %0.3f, acc1 %0.3f, acc5 %0.3f" % \
-                            ( epoch_id, step_id, total_loss / total_sample, \
-                              total_acc1 / total_sample, total_acc5 / total_sample))
-                    avg_batch_time = time.time()
-                else:
-                    speed = PRINT_STEP / (time.time() - avg_batch_time)
-                    speed_list.append(speed)
-                    logging.info( "epoch %d | step %d, loss %0.3f, acc1 %0.3f, acc5 %0.3f, speed %.3f steps/s" % \
-                           ( epoch_id, step_id, total_loss / total_sample, \
-                             total_acc1 / total_sample, total_acc5 / total_sample, speed))
-                    avg_batch_time = time.time()
-
-            step_idx += 1
-            if step_idx == STEP_NUM:
-                break
-
-        return pred_, avg_loss, acc_top1, acc_top5
+        return pred_res.numpy()
 
 
 class TestSeResnet(unittest.TestCase):
@@ -452,9 +442,23 @@ class TestSeResnet(unittest.TestCase):
             batch_size=BATCH_SIZE,
             drop_last=True)
 
+    def verify_predict(self):
+        image = np.random.random([1, 3, 224, 224]).astype('float32')
+        dy_pre = predict_dygraph(image)
+        st_pre = predict_static(image)
+        dy_jit_pre = predict_dygraph_jit(image)
+        self.assertTrue(
+            np.allclose(dy_pre, st_pre),
+            msg="dy_pre:\n {}\n, st_pre: \n{}.".format(dy_pre, st_pre))
+        self.assertTrue(
+            np.allclose(dy_jit_pre, st_pre),
+            msg="dy_jit_pre:\n {}\n, st_pre: \n{}.".format(dy_jit_pre, st_pre))
+
     def test_check_result(self):
-        pred_1, loss_1, acc1_1, acc5_1 = train_static(self.train_reader)
-        pred_2, loss_2, acc1_2, acc5_2 = train_dygraph(self.train_reader)
+        pred_1, loss_1, acc1_1, acc5_1 = train(
+            self.train_reader, to_static=False)
+        pred_2, loss_2, acc1_2, acc5_2 = train(
+            self.train_reader, to_static=True)
 
         self.assertTrue(
             np.allclose(pred_1, pred_2),
@@ -468,6 +472,8 @@ class TestSeResnet(unittest.TestCase):
         self.assertTrue(
             np.allclose(acc5_1, acc5_2),
             msg="static acc5: {} \ndygraph acc5: {}".format(acc5_1, acc5_2))
+
+        self.verify_predict()
 
 
 if __name__ == '__main__':

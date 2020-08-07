@@ -30,6 +30,8 @@ limitations under the License. */
 #include "paddle/fluid/framework/ir/graph_helper.h"
 #include "paddle/fluid/framework/ir/memory_optimize_pass/memory_optimization_var_info.h"
 #include "paddle/fluid/framework/ir/memory_optimize_pass/reference_count_pass_helper.h"
+#include "paddle/fluid/framework/ir/multi_devices_graph_pass/set_reader_device_info_utils.h"
+#include "paddle/fluid/platform/event.h"
 #include "paddle/fluid/platform/profiler.h"
 
 DECLARE_double(eager_delete_tensor_gb);
@@ -79,15 +81,6 @@ class ParallelExecutorPrivate {
         }
       }
     }
-  }
-
-  void InitReaderDeviceCount(ir::Graph *graph) const {
-    auto pass =
-        ir::PassRegistry::Instance().Get("init_reader_device_count_pass");
-    pass->SetNotOwned<const Scope>(details::kGlobalScope, global_scope_);
-    pass->SetNotOwned<const std::vector<platform::Place>>(details::kPlaces,
-                                                          &places_);
-    pass->Apply(graph);
   }
 
   void SetHasFeed(size_t dev_idx, bool has_feed = true);
@@ -371,17 +364,17 @@ ir::Graph *ParallelExecutorPrivate::ApplyMemoryOptimizePass(ir::Graph *graph) {
     if (platform::is_gpu_place(place)) {
       if (IsFastEagerDeletionModeEnabled()) {
         gc.reset(new UnsafeFastGPUGarbageCollector(
-            boost::get<platform::CUDAPlace>(place), max_memory_size));
+            BOOST_GET_CONST(platform::CUDAPlace, place), max_memory_size));
       } else {
         gc.reset(new StreamGarbageCollector(
-            boost::get<platform::CUDAPlace>(place), max_memory_size));
+            BOOST_GET_CONST(platform::CUDAPlace, place), max_memory_size));
       }
       VLOG(10) << "Created " << i << "-th GarbageCollector at " << place;
     } else {
 #endif
       if (platform::is_cpu_place(place)) {
-        gc.reset(new CPUGarbageCollector(boost::get<platform::CPUPlace>(place),
-                                         max_memory_size));
+        gc.reset(new CPUGarbageCollector(
+            BOOST_GET_CONST(platform::CPUPlace, place), max_memory_size));
         VLOG(10) << "Created GarbageCollector at " << place;
       } else {
         PADDLE_THROW(platform::errors::PreconditionNotMet(
@@ -456,7 +449,8 @@ ParallelExecutor::ParallelExecutor(const std::vector<platform::Place> &places,
                                    const BuildStrategy &build_strategy,
                                    ir::Graph *graph)
     : member_(new ParallelExecutorPrivate(places, scope)) {
-  member_->InitReaderDeviceCount(graph);
+  ir::InitReaderQueueDeviceCount(graph, *(member_->global_scope_),
+                                 member_->places_.size());
   member_->use_cuda_ = exec_strategy.use_cuda_;
   member_->build_strategy_ = build_strategy;
   member_->use_all_reduce_ = member_->build_strategy_.reduce_ ==
@@ -733,6 +727,14 @@ ParallelExecutor::ParallelExecutor(const std::vector<platform::Place> &places,
       op->SetLocalExecScopes(scope_map);
     }
   }
+
+  if (final_graphs.size() == 1) {
+    ir::SetReaderOpDeviceInfo(final_graphs[0], member_->places_.size());
+  } else {
+    for (size_t i = 0; i < final_graphs.size(); ++i) {
+      ir::SetReaderOpDeviceInfo(final_graphs[i], member_->places_.size(), i);
+    }
+  }
 }
 
 void ParallelExecutor::BCastParamsToDevices(
@@ -819,6 +821,8 @@ void ParallelExecutor::BCastParamsToDevices(
 FetchResultType ParallelExecutor::Run(
     const std::vector<std::string> &fetch_tensors, bool return_merged) {
   VLOG(3) << "enter ParallelExecutor Run";
+  platform::RecordEvent parallel_executor_event(
+      "ParallelExecutor::Run", paddle::platform::EventRole::kSpecial);
 #ifdef WITH_GPERFTOOLS
   if (gProfileStarted) {
     ProfilerFlush();
@@ -1061,4 +1065,3 @@ USE_PASS(reference_count_pass);
 USE_PASS(eager_deletion_pass);
 USE_PASS(buffer_shared_inplace_pass);
 USE_PASS(buffer_shared_cross_op_memory_reuse_pass);
-USE_PASS(init_reader_device_count_pass);

@@ -40,10 +40,6 @@ namespace operators {
 using Tensor = framework::Tensor;
 using LoDTensor = framework::LoDTensor;
 
-#define CUDA_KERNEL_LOOP(i, n)                                 \
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
-       i += blockDim.x * gridDim.x)
-
 const int CUDA_NUM_THREADS = 1024;
 static inline int GET_BLOCKS(const int N) {
   return (N + CUDA_NUM_THREADS - 1) / CUDA_NUM_THREADS;
@@ -249,7 +245,7 @@ class DeformablePSROIPoolCUDAKernel : public framework::OpKernel<T> {
     int bytes = roi_batch_id_list.numel() * sizeof(int);
     auto roi_ptr = memory::Alloc(dev_ctx, bytes);
     int* roi_id_data = reinterpret_cast<int*>(roi_ptr->ptr());
-    const auto gplace = boost::get<platform::CUDAPlace>(ctx.GetPlace());
+    const auto gplace = BOOST_GET_CONST(platform::CUDAPlace, ctx.GetPlace());
     memory::Copy(gplace, roi_id_data, cplace, roi_batch_id_data, bytes,
                  dev_ctx.stream());
 
@@ -520,7 +516,7 @@ class DeformablePSROIPoolGradCUDAKernel : public framework::OpKernel<T> {
     int bytes = roi_batch_id_list.numel() * sizeof(int);
     auto roi_ptr = memory::Alloc(dev_ctx, bytes);
     int* roi_id_data = reinterpret_cast<int*>(roi_ptr->ptr());
-    const auto gplace = boost::get<platform::CUDAPlace>(ctx.GetPlace());
+    const auto gplace = BOOST_GET_CONST(platform::CUDAPlace, ctx.GetPlace());
     memory::Copy(gplace, roi_id_data, cplace, roi_batch_id_data, bytes,
                  dev_ctx.stream());
 

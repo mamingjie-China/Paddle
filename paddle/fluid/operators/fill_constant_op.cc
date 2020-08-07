@@ -30,7 +30,7 @@ class FillConstantOp : public framework::OperatorWithKernel {
         PADDLE_ENFORCE_GE(
             shape[i], 0,
             platform::errors::InvalidArgument(
-                "Each value of attribute 'shape' is expected to be greater "
+                "Each value of attribute 'shape' is expected to be no less "
                 "than 0. But recieved: shape[%u] = %d; shape = [%s].",
                 i, shape[i], framework::make_ddim(shape)));
       }
@@ -51,6 +51,17 @@ class FillConstantOp : public framework::OperatorWithKernel {
   }
 
  protected:
+  framework::OpKernelType GetKernelTypeForVar(
+      const std::string& var_name, const framework::Tensor& tensor,
+      const framework::OpKernelType& expected_kernel_type) const override {
+    if (var_name == "ShapeTensor" || var_name == "ShapeTensorList") {
+      return expected_kernel_type;
+    } else {
+      return framework::OpKernelType(expected_kernel_type.data_type_,
+                                     tensor.place(), tensor.layout());
+    }
+  }
+
   framework::OpKernelType GetExpectedKernelType(
       const framework::ExecutionContext& ctx) const override {
     return framework::OpKernelType(
@@ -63,9 +74,8 @@ class FillConstantOpVarTypeInference : public framework::VarTypeInference {
  public:
   void operator()(framework::InferVarTypeContext* ctx) const override {
     auto data_type = static_cast<framework::proto::VarType::Type>(
-        boost::get<int>(ctx->GetAttr("dtype")));
-    auto& out_var_name = ctx->Output("Out").front();
-    ctx->SetDataType(out_var_name, data_type);
+        BOOST_GET_CONST(int, ctx->GetAttr("dtype")));
+    ctx->SetOutputDataType("Out", data_type);
   }
 };
 

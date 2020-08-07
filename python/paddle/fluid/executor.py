@@ -40,6 +40,8 @@ InferAnalysisConfig = core.AnalysisConfig
 
 def global_scope():
     """
+    :api_attr: Static Graph
+
     Get the global/default scope instance. There are a lot of APIs use
     :code:`global_scope` as its default value, e.g., :code:`Executor.run`
 
@@ -68,6 +70,8 @@ def _switch_scope(scope):
 @signature_safe_contextmanager
 def scope_guard(scope):
     """
+    :api_attr: Static Graph
+    
     This function switches scope through python `with` statement.
     Scope records the mapping between variable names and variables ( :ref:`api_guide_Variable` ),
     similar to brackets in programming languages.
@@ -97,8 +101,10 @@ def scope_guard(scope):
     """
 
     ex = _switch_scope(scope)
-    yield
-    _switch_scope(ex)
+    try:
+        yield
+    finally:
+        _switch_scope(ex)
 
 
 def as_numpy(tensor):
@@ -398,29 +404,35 @@ def _as_lodtensor(data, place, dtype=None):
             >>>     ...
 
         Args:
-            data(numpy.ndarray): a instance of array
+            data(numpy.ndarray|list|tuple|scalar): a instance of array, scalar, list or tuple
             data(core.Place): the place of created tensor
-            dtype(core.VarDesc.VarType): the expected data type of created tensor
+            dtype(core.VarDesc.VarType|str): the expected data type of created tensor
 
         Returns:
             LoDTensor
         """
-    if isinstance(data, list):
-        raise RuntimeError("Some of your feed data hold LoD information. \
-                They can not be completely cast from a list of Python \
-                ndarray to LoDTensor. Please convert data to LoDTensor \
-                directly before feeding the data.\
-                ")
-
-    #NOTE(zhiqiu): convert python builtin ,like float and int, to numpy array
+    #NOTE(zhiqiu): convert python builtin, like float, int, and list, to numpy ndarray
     if not isinstance(data, np.ndarray):
+        assert dtype is not None, 'The dtype should be given when feed data is not np.ndarray'
+        dtype = convert_dtype(dtype) if isinstance(
+            dtype, core.VarDesc.VarType) else dtype
         if np.isscalar(data):
-            assert dtype is not None, 'dtype should be given when casting python scalar to tensor'
-            dtype = convert_dtype(dtype) if isinstance(
-                dtype, core.VarDesc.VarType) else dtype
             data = np.array([data]).astype(dtype)
+        elif isinstance(data, (list, tuple)):
+            data = np.array(data)
+            if data.dtype == np.object:
+                raise TypeError(
+                    "\n\tFaild to convert input data to a regular ndarray :\n\t* Usually "
+                    "this means the input data contains nested lists with different lengths. "
+                    "Please consider using 'fluid.create_lod_tensor' to convert it to a LoD-Tensor."
+                )
+            data = data.astype(dtype)
+        else:
+            raise TypeError(
+                "Convert data of type {} to Tensor is not supported".format(
+                    type(data)))
 
-    # single tensor case
+    # convert numpy.ndarray to tensor
     tensor = core.LoDTensor()
     tensor.set(data, place)
     return tensor
@@ -454,6 +466,8 @@ handler = FetchHandlerExample(var_dict=var_dict)
 
 class Executor(object):
     """
+    :api_attr: Static Graph
+
     An Executor in Python, supports single/multiple-GPU running,
     and single/multiple-CPU running.
 
@@ -516,7 +530,7 @@ class Executor(object):
           #     os.environ['CPU_NUM'] = str(2)
 
           # If you don't set place and PaddlePaddle is CPU version
-          # os.environ['CPU_NUM'] = str(2)
+          os.environ['CPU_NUM'] = str(2)
 
           compiled_prog = compiler.CompiledProgram(
               train_program).with_data_parallel(
@@ -931,14 +945,14 @@ class Executor(object):
             return_merged(bool): This parameter indicates whether fetched variables (the variables
                 specified in the fetch list) should be merged according to the execution device dimension.
                 If :code:`return_merged` is False, the type of the return value is a two-dimensional list
-                of :code:`Tensor` ( :code:`return_numpy` is False) or a two-dimensional list of
-                :code:`numpy.ndarray` ( :code:`return_numpy` is True). If :code:`return_merged` is True,
-                the type of the return value is an one-dimensional list of :code:`Tensor` ( :code:`return_numpy`
-                is False) or an one-dimensional list of :code:`numpy.ndarray` ( :code:`return_numpy` is True).
-                Please see Examples 2 for more details. If the lengths of fetched results are variant, please
-                set :code:`return_merged` as False, which denotes that the fetched results will not be merged.
-                The default is True, but it is just for the compatibility, and may use False as default value
-                in the future version.
+                of :code:`Tensor` / :code:`LoDTensorArray` ( :code:`return_numpy` is False) or a two-dimensional
+                list of :code:`numpy.ndarray` ( :code:`return_numpy` is True). If :code:`return_merged` is True,
+                the type of the return value is an one-dimensional list of :code:`Tensor` / :code:`LoDTensorArray`
+                ( :code:`return_numpy` is False) or an one-dimensional list of :code:`numpy.ndarray`
+                ( :code:`return_numpy` is True). Please see Examples 2 for more details. If the lengths of fetched
+                results are variant, please set :code:`return_merged` as False, which denotes that the fetched
+                results will not be merged. The default is True, but it is just for the compatibility, and may
+                use False as default value in the future version.
             use_prune(bool): This parameter indicates whether the input :code:`Program` will be pruned. 
                 If the parameter is True, the program will be pruned accroding to the given feed and fetch_list,
                 which means the operators and variables in program that generate :code:`feed` and are not 
@@ -980,13 +994,17 @@ class Executor(object):
               loss = fluid.layers.mean(hidden)
               adam = fluid.optimizer.Adam()
               adam.minimize(loss)
+              i = fluid.layers.zeros(shape=[1], dtype='int64')
+              array = fluid.layers.array_write(x=loss, i=i)
 
               # Run the startup program once and only once.
               exe.run(fluid.default_startup_program())
 
               x = numpy.random.random(size=(10, 1)).astype('float32')
-              outs = exe.run(feed={'X': x},
-                             fetch_list=[loss.name])
+              loss_val, array_val = exe.run(feed={'X': x},
+                                            fetch_list=[loss.name, array.name])
+              print(array_val)
+              # [array([0.02153828], dtype=float32)]
 
         Examples 2:
             .. code-block:: python
@@ -1061,9 +1079,6 @@ class Executor(object):
                 use_prune=use_prune,
                 return_merged=return_merged)
         except Exception as e:
-            if not isinstance(e, core.EOFException):
-                warnings.warn(
-                    "The following exception is not an EOF exception.")
             six.reraise(*sys.exc_info())
 
     def _run_impl(self, program, feed, fetch_list, feed_var_name,
@@ -1139,6 +1154,23 @@ class Executor(object):
 
         # For backward compatibility, run directly.
         if not compiled:
+            # In distributed training, the compiled program is saved in Program._graph
+            has_compiled_graph = isinstance(program._graph,
+                                            compiler.CompiledProgram)
+            if has_compiled_graph:
+                program._graph._compile(scope, self.place)
+                # _graph in program does not support inference since the _graph is optimized
+                # through optimizer.minimize function and should not be used as inference graph
+                # assert not program._graph._is_inference
+                return self._run_parallel(
+                    program._graph,
+                    scope=scope,
+                    feed=feed,
+                    fetch_list=fetch_list,
+                    fetch_var_name=fetch_var_name,
+                    return_numpy=return_numpy,
+                    return_merged=return_merged)
+
             return self._run_program(
                 program,
                 feed=feed,
@@ -1226,7 +1258,7 @@ class Executor(object):
         else:
             self._default_executor.run_prepared_ctx(ctx, scope, False, False,
                                                     False)
-        arr = scope.find_var(fetch_var_name).get_lod_tensor_array()
+        arr = scope.find_var(fetch_var_name).get_fetch_list()
         tensors = arr._move_to_list()
         if return_numpy:
             return as_numpy(tensors)
@@ -1268,6 +1300,12 @@ class Executor(object):
                          fetch_list=None,
                          fetch_info=None,
                          print_period=100):
+        is_heter = 0
+        if not program._fleet_opt is None:
+            if program._fleet_opt.get("worker_class", "") == "HeterCpuWorker":
+                is_heter = 1
+            if program._fleet_opt("trainer", "") == "HeterXpuTrainer":
+                is_heter = 1
         if scope is None:
             scope = global_scope()
         if fetch_list is None:
@@ -1276,6 +1314,11 @@ class Executor(object):
             fetch_info = []
         assert len(fetch_list) == len(fetch_info)
         compiled = isinstance(program, compiler.CompiledProgram)
+        if is_heter:
+            from paddle.fluid.incubate.fleet.parameter_server.pslib import fleet
+            from paddle.fluid.incubate.fleet.utils.fleet_util import FleetUtil
+            fu = FleetUtil()
+            ret = fu.split_program_by_device(program)
         if not compiled:
             # TODO: Need a better way to distinguish and specify different execution mode
             if program._pipeline_opt:
@@ -1285,6 +1328,8 @@ class Executor(object):
                 trainer = TrainerFactory()._create_trainer(program._fleet_opt)
                 trainer._set_thread_barrier(program._is_distributed)
             trainer._set_program(program)
+            if is_heter:
+                trainer._set_heter_info(ret)
         else:
             if program._pipeline_opt:
                 trainer = TrainerFactory()._create_trainer(
@@ -1319,14 +1364,25 @@ class Executor(object):
                           fetch_info=None,
                           print_period=100,
                           fetch_handler=None):
-        if dataset is None:
-            raise RuntimeError("dataset is need and should be initialized")
-
-        if program._pipeline_opt is not None and program._pipeline_opt[
-                "sync_steps"] != -1:
-            # hack for paddlebox: sync_steps(-1) denotes paddlebox
-            thread = self._adjust_pipeline_resource(program._pipeline_opt,
-                                                    dataset, thread)
+        if program._pipeline_opt is not None:
+            import paddle
+            if dataset is not None:
+                raise RuntimeError("dataset should be None for pipeline mode")
+            # The following fake dataset is created to call 
+            # the _prepare_trainer api, and it is meaningless.
+            data_vars = []
+            for var in program.global_block().vars.values():
+                if var.is_data:
+                    data_vars.append(var)
+            dataset = paddle.fluid.DatasetFactory().create_dataset(
+                'FileInstantDataset')
+            dataset.set_batch_size(1)
+            dataset.set_thread(1)
+            dataset.set_filelist(['None'])
+            dataset.set_use_var(data_vars)
+        else:
+            if dataset is None:
+                raise RuntimeError("dataset is need and should be initialized")
 
         dataset._prepare_to_run()
 
@@ -1417,8 +1473,8 @@ class Executor(object):
 
                 place = fluid.CPUPlace() # you can set place = fluid.CUDAPlace(0) to use gpu
                 exe = fluid.Executor(place)
-                x = fluid.layers.data(name="x", shape=[10, 10], dtype="int64")
-                y = fluid.layers.data(name="y", shape=[1], dtype="int64", lod_level=1)
+                x = fluid.data(name="x", shape=[None, 10, 10], dtype="int64")
+                y = fluid.data(name="y", shape=[None, 1], dtype="int64", lod_level=1)
                 dataset = fluid.DatasetFactory().create_dataset()
                 dataset.set_use_var([x, y])
                 dataset.set_thread(1)
@@ -1432,6 +1488,60 @@ class Executor(object):
         return self._run_from_dataset(program, dataset, scope, thread, True,
                                       debug, fetch_list, fetch_info,
                                       print_period, fetch_handler)
+
+    def start_heter_trainer(self,
+                            program=None,
+                            scope=None,
+                            debug=False,
+                            fetch_list=None,
+                            fetch_info=None,
+                            print_period=100,
+                            fetch_handler=None):
+        return self._start_heter_trainer(program, scope, False, debug,
+                                         fetch_list, fetch_info, print_period,
+                                         fetch_handler)
+
+    def _start_heter_trainer(self,
+                             program=None,
+                             scope=None,
+                             is_infer=False,
+                             debug=False,
+                             fetch_list=None,
+                             fetch_info=None,
+                             print_period=100,
+                             fetch_handler=None):
+
+        scope, trainer = self._prepare_trainer(
+            program=program,
+            dataset=None,
+            scope=scope,
+            thread=1,
+            debug=debug,
+            fetch_list=fetch_list,
+            fetch_info=fetch_info,
+            print_period=print_period)
+
+        trainer._set_infer(is_infer)
+        trainer._gen_trainer_desc()
+
+        self._dump_debug_info(program=program, trainer=trainer)
+
+        trainer_instance = self._default_executor.init_for_dataset(
+            program.desc, trainer._desc(), scope, None)
+
+        #if fetch_handler is not None:
+        #    scope0 = trainer_instance.get_worker_scope(0)
+        #    fetch_monitor = FetchHandlerMonitor(scope0, fetch_handler)
+        #    fetch_monitor.start()
+        #    self._default_executor.run_from_dataset(trainer_instance)
+        #    fetch_monitor.stop()
+        #    self._default_executor.release_trainer(trainer_instance)
+        #else:
+
+        self._default_executor.run_from_dataset(trainer_instance)
+        #self._default_executor.release_trainer(trainer_instance)
+
+        return trainer_instance
 
     def train_from_dataset(self,
                            program=None,
@@ -1483,8 +1593,8 @@ class Executor(object):
 
               place = fluid.CPUPlace() # you can set place = fluid.CUDAPlace(0) to use gpu
               exe = fluid.Executor(place)
-              x = fluid.layers.data(name="x", shape=[10, 10], dtype="int64")
-              y = fluid.layers.data(name="y", shape=[1], dtype="int64", lod_level=1)
+              x = fluid.data(name="x", shape=[None, 10, 10], dtype="int64")
+              y = fluid.data(name="y", shape=[None, 1], dtype="int64", lod_level=1)
               dataset = fluid.DatasetFactory().create_dataset()
               dataset.set_use_var([x, y])
               dataset.set_thread(1)
